@@ -30,7 +30,6 @@ from betfair_parser.spec.betting.orders import ReplaceOrders
 from betfair_parser.spec.betting.type_definitions import CancelExecutionReport
 from betfair_parser.spec.betting.type_definitions import CurrentOrderSummary
 from betfair_parser.spec.betting.type_definitions import PlaceExecutionReport
-from betfair_parser.spec.common import BetId
 from betfair_parser.spec.common import TimeRange
 from betfair_parser.spec.streaming import OCM
 from betfair_parser.spec.streaming import Connection
@@ -276,6 +275,15 @@ class BetfairExecutionClient(LiveExecutionClient):
 
     # -- EXECUTION REPORTS ------------------------------------------------------------------------
 
+    def _market_ids_filter(self) -> set[str] | None:
+        if (
+            self.config.instrument_config
+            and self.config.reconcile_market_ids_only
+            and self.config.instrument_config.market_ids
+        ):
+            return set(self.config.instrument_config.market_ids)
+        return None
+
     async def generate_order_status_report(
         self,
         instrument_id: InstrumentId,
@@ -287,7 +295,7 @@ class BetfairExecutionClient(LiveExecutionClient):
             venue_order_id is not None or client_order_id is not None
         ), "Require one of venue_order_id or client_order_id"
         if venue_order_id is not None:
-            bet_id = BetId(venue_order_id.value)
+            bet_id = venue_order_id.value
             orders = await self._client.list_current_orders(bet_ids={bet_id})
         else:
             customer_order_ref = make_customer_order_ref(client_order_id)
@@ -326,18 +334,16 @@ class BetfairExecutionClient(LiveExecutionClient):
         end: pd.Timestamp | None = None,
         open_only: bool = False,
     ) -> list[OrderStatusReport]:
+        current_orders: list[CurrentOrderSummary] = await self._client.list_current_orders(
+            order_projection=OrderProjection.EXECUTABLE if open_only else OrderProjection.ALL,
+            date_range=TimeRange(from_=start, to=end),
+            market_ids=self._market_ids_filter(),
+        )
+
         ts_init = self._clock.timestamp_ns()
-        current_live_orders: list[CurrentOrderSummary] = await self._client.list_current_orders(
-            order_projection=OrderProjection.EXECUTABLE,
-            date_range=TimeRange(from_=start, to=end),
-        )
-        current_filled_orders: list[CurrentOrderSummary] = await self._client.list_current_orders(
-            order_projection=OrderProjection.EXECUTION_COMPLETE,
-            date_range=TimeRange(from_=start, to=end),
-        )
-        orders = current_live_orders + current_filled_orders
-        order_status_reports = []
-        for order in orders:
+
+        order_status_reports: list[OrderStatusReport] = []
+        for order in current_orders:
             instrument_id = betfair_instrument_id(
                 market_id=order.market_id,
                 selection_id=order.selection_id,
@@ -365,13 +371,15 @@ class BetfairExecutionClient(LiveExecutionClient):
         start: pd.Timestamp | None = None,
         end: pd.Timestamp | None = None,
     ) -> list[FillReport]:
-        ts_init = self._clock.timestamp_ns()
         cleared_orders: list[CurrentOrderSummary] = await self._client.list_current_orders(
             order_projection=OrderProjection.ALL,
             date_range=TimeRange(from_=start, to=end),
+            market_ids=self._market_ids_filter(),
         )
 
-        fill_reports = []
+        ts_init = self._clock.timestamp_ns()
+
+        fill_reports: list[FillReport] = []
         for order in cleared_orders:
             if order.size_matched == 0.0:
                 # No executions, skip
